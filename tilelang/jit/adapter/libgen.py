@@ -82,6 +82,25 @@ class LibraryGenerator:
             lib_path = self.libpath
         else:
             self.libpath = lib_path
+        # PTO_USE_SIM: preload the CA model libraries with RTLD_GLOBAL so
+        # lib_kernel.so's rt*/Msprof* glue resolves against a fully
+        # initialized simulator. Load the simulator/$SOC/lib/ copies (NOT
+        # camodel/): the lib/ libnpu_drv_camodel.so carries the
+        # libstars.so/libffts_model.so dependency pair that must relocate
+        # in one dlopen group. Restored from the pre-#280 machine144 flow
+        # (env_setup_machine144.md §4c).
+        if os.environ.get("PTO_USE_SIM", "").lower() in ("1", "true", "yes", "on"):
+            ascend_home = os.environ.get("ASCEND_HOME_PATH", "")
+            soc = os.environ.get("SOC_VERSION", "dav_3510")
+            sim_lib = os.path.join(ascend_home, "x86_64-linux", "simulator", soc, "lib")
+            preload = [
+                os.path.join(ascend_home, "x86_64-linux", "lib64", "libc_sec.so"),
+                os.path.join(sim_lib, "libnpu_drv_camodel.so"),
+                os.path.join(sim_lib, "libruntime_camodel.so"),
+            ]
+            for so in preload:
+                if os.path.isfile(so):
+                    ctypes.CDLL(so, mode=ctypes.RTLD_GLOBAL)
         return ctypes.CDLL(lib_path)
 
     def compile_lib(self, timeout: float = None):
@@ -184,14 +203,13 @@ class LibraryGenerator:
             npu_arch = get_target_npu_arch(target)
             configured_options = normalize_options((self.pass_configs or {}).get(PassConfigKey.TL_DEVICE_COMPILE_FLAGS))
             explicit_options = normalize_options(self.compile_flags)
-            # Keep repeated option/value pairs such as -mllvm intact and ordered.
-            # Merge here to bypass the token deduplication below.
             extra_compile_options = []
+            for option in [*configured_options, *explicit_options]:
+                if option not in extra_compile_options:
+                    extra_compile_options.append(option)
             command = [
                 find_bisheng_path(),
                 *get_bisheng_compile_options(npu_arch),
-                *configured_options,
-                *explicit_options,
                 # Avoid using mmap to write linker output, thus more friendly for distributed FS
                 "-Wl,--no-mmap-output-file",
                 "--shared",
@@ -441,6 +459,22 @@ class LibraryGenerator:
             "-o",
             launch_obj,
         ]
+        # PTO_USE_SIM: the CA simulator launch code includes acl/runtime
+        # headers; add the CANN include paths (restored from pre-#280).
+        if os.environ.get("PTO_USE_SIM", "").lower() in ("1", "true", "yes", "on"):
+            ascend_home = os.environ.get("ASCEND_HOME_PATH", "")
+            if ascend_home:
+                for include_subdir in (
+                    "x86_64-linux/include",
+                    "include",
+                    "x86_64-linux/pkg_inc",
+                    "x86_64-linux/pkg_inc/runtime",
+                    "x86_64-linux/pkg_inc/profiling",
+                    "x86_64-linux/pkg_inc/toolchain",
+                ):
+                    include_path = os.path.join(ascend_home, include_subdir)
+                    if os.path.isdir(include_path):
+                        compile_cmd.insert(-2, "-I" + include_path)
         link_cmd = [
             bisheng_bin,
             "-fPIC",
@@ -452,6 +486,17 @@ class LibraryGenerator:
             launch_obj,
             "-Wl,--no-as-needed",
         ]
+        # PTO_USE_SIM: link the CA simulator runtime explicitly so the
+        # fatobj's rt*/Msprof* device-launch glue resolves at dlopen (the
+        # camodel libruntime.so's soname is libruntime_camodel.so, found on
+        # the simulator LD_LIBRARY_PATH). Restored behavior from the
+        # pre-#280 machine144 flow.
+        if os.environ.get("PTO_USE_SIM", "").lower() in ("1", "true", "yes", "on"):
+            soc = os.environ.get("SOC_VERSION", "dav_3510")
+            ascend_home = os.environ.get("ASCEND_HOME_PATH", "")
+            sim_rt = os.path.join(ascend_home, "x86_64-linux", "simulator", soc, "camodel", "libruntime.so")
+            if os.path.isfile(sim_rt):
+                link_cmd.append(sim_rt)
 
         for cmd in (compile_cmd, link_cmd):
             if self.verbose:

@@ -21,6 +21,7 @@ from .utils import (
     parse_tma_descriptor_args,
 )
 import ast
+import os
 import re
 import logging
 import textwrap
@@ -232,7 +233,6 @@ class TLCUDASourceWrapper:
         "float8_e5m2": "fp8_e5_t",
         "float64": "double",
         "int64": "int64_t",
-        "uint64": "uint64_t",
         "int32": "int",
         "uint32": "unsigned int",
         "bool": "int8_t",
@@ -1428,6 +1428,8 @@ class TLPTOSourceWrapper:
                     "name": name,
                     "host_type": "void *",
                     "kind": "pointer",
+                    # byte size for the PTO_USE_SIM rtMalloc/rtMemcpy staging
+                    "size_bytes": self._buffer_size_bytes(buffer),
                 }
                 host_args.append(info)
                 add_alias(name, info)
@@ -1469,6 +1471,24 @@ class TLPTOSourceWrapper:
     @staticmethod
     def _is_pointer_param(param: tvm.tirx.Var) -> bool:
         return isinstance(param.type_annotation, tvm.ir.PointerType)
+
+    @staticmethod
+    def _dtype_nbytes(dtype: str) -> int:
+        if dtype in {"float32", "int32", "uint32"}:
+            return 4
+        if dtype in {"float16", "bfloat16", "int16", "uint16"}:
+            return 2
+        if dtype in {"int8", "uint8", "bool", "float8_e4m3fn", "float8_e5m2", "float4_e2m1fnx2"}:
+            return 1
+        raise RuntimeError(f"Unsupported PTO simulator buffer dtype: {dtype}")
+
+    def _buffer_size_bytes(self, buffer) -> int | None:
+        elem_count = 1
+        for dim in buffer.shape:
+            if not isinstance(dim, tvm.tirx.IntImm):
+                return None
+            elem_count *= int(dim.value)
+        return elem_count * self._dtype_nbytes(str(buffer.dtype))
 
     def _render_scalar_expr(
         self,
@@ -1526,6 +1546,7 @@ class TLPTOSourceWrapper:
         call_site: _PTOKernelCallSite,
         index: int,
         host_arg_by_name: dict[str, dict[str, Any]],
+        pointer_map: dict[str, str] | None = None,
     ) -> str:
         kernel = call_site.kernel
         expr = call_site.function_args[index]
@@ -1538,7 +1559,10 @@ class TLPTOSourceWrapper:
             info = host_arg_by_name.get(expr.name)
             if info is None or info["kind"] != "pointer":
                 raise RuntimeError(f"{context} cannot map host pointer variable `{expr.name}` to the exported call ABI.")
-            return f"({prototype_type}){info['name']}"
+            ptr_name = info["name"]
+            if pointer_map is not None:
+                ptr_name = pointer_map.get(ptr_name, ptr_name)
+            return f"({prototype_type}){ptr_name}"
 
         rendered = self._render_scalar_expr(expr, host_arg_by_name, context)
         return f"({prototype_type})({rendered})"
@@ -1593,14 +1617,112 @@ class TLPTOSourceWrapper:
             kernel = descriptor_by_name[kernel_name]
             prototypes.append(f'extern "C" __global__ AICORE void {kernel.name}({", ".join(kernel.prototype_types)});')
 
+        sim_enabled = os.environ.get("PTO_USE_SIM", "").lower() in ("1", "true", "yes", "on")
+        sim_enabled = sim_enabled and all(info.get("size_bytes") is not None for info in host_args if info["kind"] == "pointer")
+
+        if sim_enabled:
+            pre_launch_lines = []
+            post_launch_lines = []
+            sim_pointer_map = {}
+            for arg in host_args:
+                if arg["kind"] != "pointer":
+                    continue
+                name = arg["name"]
+                size = arg["size_bytes"]
+                sim_pointer_map[name] = f"dev_{name}"
+                pre_launch_lines.extend([
+                    f"  void *dev_{name} = nullptr;\n",
+                    f"  auto malloc_ret_{name} = rtMalloc(&dev_{name}, {size}, RT_MEMORY_HBM, 0);\n",
+                    f"  if (malloc_ret_{name} != 0) {{\n",
+                    f"    snprintf(error_buf, ERROR_BUF_SIZE, \"rtMalloc {name} failed: %d\", (int)malloc_ret_{name});\n",
+                    f"    fprintf(stderr, \"PTO_SIM_ERR[{name}]: %s\\n\", error_buf); return -1;\n",
+                    f"  }}\n",
+                    f"  auto h2d_ret_{name} = rtMemcpy(dev_{name}, {size}, {name}, {size}, RT_MEMCPY_HOST_TO_DEVICE);\n",
+                    f"  if (h2d_ret_{name} != 0) {{\n",
+                    f"    snprintf(error_buf, ERROR_BUF_SIZE, \"rtMemcpy H2D {name} failed: %d\", (int)h2d_ret_{name});\n",
+                    f"    fprintf(stderr, \"PTO_SIM_ERR[{name}]: %s\\n\", error_buf); return -1;\n",
+                    f"  }}\n",
+                ])
+                post_launch_lines.extend([
+                    f"  auto d2h_ret_{name} = rtMemcpy({name}, {size}, dev_{name}, {size}, RT_MEMCPY_DEVICE_TO_HOST);\n",
+                    f"  if (d2h_ret_{name} != 0) {{\n",
+                    f"    snprintf(error_buf, ERROR_BUF_SIZE, \"rtMemcpy D2H {name} failed: %d\", (int)d2h_ret_{name});\n",
+                    f"    fprintf(stderr, \"PTO_SIM_ERR[{name}]: %s\\n\", error_buf); return -1;\n",
+                    f"  }}\n",
+                    f"  rtFree(dev_{name});\n",
+                ])
+            pre_launch = "".join(pre_launch_lines)
+            stream_setup = (
+                "  rtStream_t launch_stream = (rtStream_t)stream;\n"
+                "  bool owns_stream = false;\n"
+                "  if (stream == reinterpret_cast<void *>(-1)) {\n"
+                "    launch_stream = nullptr;\n"
+                "  }\n"
+                "  if (launch_stream == nullptr) {\n"
+                "    auto create_ret = rtStreamCreate(&launch_stream, 0);\n"
+                "    if (create_ret != 0) {\n"
+                "      snprintf(error_buf, ERROR_BUF_SIZE, \"rtStreamCreate failed: %d\", (int)create_ret);\n"
+                "      fprintf(stderr, \"PTO_SIM_ERR[stream_create]: %s\\n\", error_buf); return -1;\n"
+                "    }\n"
+                "    owns_stream = true;\n"
+                "  }\n"
+            )
+            stream_arg = "launch_stream"
+            stream_cleanup = (
+                "  auto sync_ret = rtStreamSynchronize(launch_stream);\n"
+                "  if (sync_ret != 0) {\n"
+                "    snprintf(error_buf, ERROR_BUF_SIZE, \"rtStreamSynchronize failed: %d\", (int)sync_ret);\n"
+                "    return -1;\n"
+                "  }\n"
+                f"{''.join(post_launch_lines)}"
+                "  if (owns_stream) {\n"
+                "    auto destroy_ret = rtStreamDestroy(launch_stream);\n"
+                "    if (destroy_ret != 0) {\n"
+                "      snprintf(error_buf, ERROR_BUF_SIZE, \"rtStreamDestroy failed: %d\", (int)destroy_ret);\n"
+                "      return -1;\n"
+                "    }\n"
+                "  }\n"
+            )
+            pointer_map = sim_pointer_map
+        else:
+            pre_launch = ""
+            stream_setup = ""
+            stream_arg = "stream"
+            stream_cleanup = ""
+            pointer_map = None
+
         launches = []
         for call_site in call_sites:
             grid_dim, dynamic_smem = self._launch_metadata(call_site, host_arg_by_name)
-            call_args = [self._render_call_arg(call_site, index, host_arg_by_name) for index in range(len(call_site.function_args))]
-            launches.append(f"  {call_site.kernel.name}<<<{grid_dim}, {dynamic_smem}, stream>>>({', '.join(call_args)});")
+            call_args = [self._render_call_arg(call_site, index, host_arg_by_name, pointer_map) for index in range(len(call_site.function_args))]
+            launches.append(f"  {call_site.kernel.name}<<<{grid_dim}, {dynamic_smem}, {stream_arg}>>>({', '.join(call_args)});")
 
         prototype_source = "#ifndef AICORE\n#define AICORE [aicore]\n#endif\n" + "\n".join(prototypes)
-        launch_stub = f'extern "C" TL_EXPORT int call({", ".join(launch_params)}) {{\n' + "\n".join(launches) + "\n  return 0;\n}\n"
+        launch_stub = (
+            f'extern "C" TL_EXPORT int call({", ".join(launch_params)}) {{\n'
+            f"{pre_launch}"
+            f"{stream_setup}"
+            + "\n".join(launches)
+            + "\n"
+            f"{stream_cleanup}"
+            "  return 0;\n"
+            "}\n"
+        )
+        # PTO_USE_SIM: full rt-level sim launch (rtMalloc/rtMemcpy staging +
+        # rtStream lifecycle + rtSetDevice init), restored from the pre-#280
+        # machine144 flow (env_setup_machine144.md §4b).
+        if sim_enabled:
+            header = '#include "acl/acl.h"\n#include <runtime/dev.h>\n#include <runtime/mem.h>\n#include <runtime/rt_ffts.h>\n#include <runtime/stream.h>\n#include <cstdio>\n'
+            init_body = textwrap.dedent(
+                """
+                auto rt_set_device_ret = rtSetDevice(0);
+                if (rt_set_device_ret != 0) {
+                    snprintf(error_buf, ERROR_BUF_SIZE, "rtSetDevice failed: %d", (int)rt_set_device_ret);
+                    return -1;
+                }
+                """
+            )
+            return "\n\n".join([header, PREDEF_INIT_FUNC.format(init_body), prototype_source, launch_stub])
         return "\n\n".join([PREDEF_INIT_FUNC.format(""), prototype_source, launch_stub])
 
 

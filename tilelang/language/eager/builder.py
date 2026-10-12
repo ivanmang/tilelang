@@ -1167,8 +1167,11 @@ def get_type_hints(func):
                     continue
                 except Exception:
                     pass
-            value = ForwardRef(value, module=func.__module__)
-            hints[name] = _eval_type(value, globalns=globalns, localns=localns)
+            try:
+                hints[name] = eval(value, globalns, localns)
+            except Exception:
+                value = ForwardRef(value, module=func.__module__)
+                hints[name] = _eval_type(value, globalns=globalns, localns=localns)
         else:
             hints[name] = value
     return hints
