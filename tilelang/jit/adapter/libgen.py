@@ -54,6 +54,24 @@ class LibraryGenerator:
             lib_path = self.libpath
         else:
             self.libpath = lib_path
+        # PTO_USE_SIM: preload the CA model libraries with RTLD_GLOBAL so
+        # lib_kernel.so's rt*/Msprof* glue resolves against a fully
+        # initialized simulator. Load the simulator/$SOC/lib/ copies (NOT
+        # camodel/): the lib/ libnpu_drv_camodel.so carries the
+        # libstars.so/libffts_model.so dependency pair that must relocate
+        # in one dlopen group.
+        if os.environ.get("PTO_USE_SIM", "").lower() in ("1", "true", "yes", "on"):
+            ascend_home = os.environ.get("ASCEND_HOME_PATH", "")
+            soc = os.environ.get("SOC_VERSION", "dav_3510")
+            sim_lib = os.path.join(ascend_home, "x86_64-linux", "simulator", soc, "lib")
+            preload = [
+                os.path.join(ascend_home, "x86_64-linux", "lib64", "libc_sec.so"),
+                os.path.join(sim_lib, "libnpu_drv_camodel.so"),
+                os.path.join(sim_lib, "libruntime_camodel.so"),
+            ]
+            for so in preload:
+                if os.path.isfile(so):
+                    ctypes.CDLL(so, mode=ctypes.RTLD_GLOBAL)
         return ctypes.CDLL(lib_path)
 
     def compile_lib(self, timeout: float = None):

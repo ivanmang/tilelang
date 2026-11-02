@@ -226,6 +226,22 @@ class PTOLibraryGenerator(LibraryGenerator):
             "-o",
             launch_obj,
         ]
+        # PTO_USE_SIM: the CA simulator launch code includes acl/runtime
+        # headers; add the CANN include paths.
+        if os.environ.get("PTO_USE_SIM", "").lower() in ("1", "true", "yes", "on"):
+            ascend_home = os.environ.get("ASCEND_HOME_PATH", "")
+            if ascend_home:
+                for include_subdir in (
+                    "x86_64-linux/include",
+                    "include",
+                    "x86_64-linux/pkg_inc",
+                    "x86_64-linux/pkg_inc/runtime",
+                    "x86_64-linux/pkg_inc/profiling",
+                    "x86_64-linux/pkg_inc/toolchain",
+                ):
+                    include_path = os.path.join(ascend_home, include_subdir)
+                    if os.path.isdir(include_path):
+                        compile_cmd.insert(-2, "-I" + include_path)
         link_cmd = [
             bisheng_bin,
             "-fPIC",
@@ -237,6 +253,14 @@ class PTOLibraryGenerator(LibraryGenerator):
             launch_obj,
             "-Wl,--no-as-needed",
         ]
+        # PTO_USE_SIM: link the CA simulator runtime explicitly so the
+        # fatobj's rt*/Msprof* device-launch glue resolves at dlopen.
+        if os.environ.get("PTO_USE_SIM", "").lower() in ("1", "true", "yes", "on"):
+            soc = os.environ.get("SOC_VERSION", "dav_3510")
+            ascend_home = os.environ.get("ASCEND_HOME_PATH", "")
+            sim_rt = os.path.join(ascend_home, "x86_64-linux", "simulator", soc, "camodel", "libruntime.so")
+            if os.path.isfile(sim_rt):
+                link_cmd.append(sim_rt)
 
         for cmd in (compile_cmd, link_cmd):
             if self.verbose:
